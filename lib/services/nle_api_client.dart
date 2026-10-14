@@ -24,8 +24,8 @@ class NleApiClient {
   // Initializing-formal would require the constructor param to be named
   // `_logger` (matching the field), which is awkward for a public API. The
   // `:` form keeps the named arg `logger`.
-  // ignore: prefer_initializing_formals
   NleApiClient({required this.dio, AppLogger? logger, this.hosted = false})
+    // ignore: prefer_initializing_formals
     : _logger = logger;
 
   /// Production factory. Installs the diagnostic-logging interceptor so every
