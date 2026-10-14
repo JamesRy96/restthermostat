@@ -117,6 +117,21 @@ On first launch you'll go through a short onboarding flow:
    from the device switcher.
 4. **Connected.** You're in.
 
+### Using the hosted NoLongerEvil service
+
+Instead of a self-hosted server you can point the app at the hosted service:
+
+1. On <https://nolongerevil.com/settings> → **API Keys**, generate a key with
+   both `read` and `write` scopes and copy it (it's shown once).
+2. In the app, enter `nolongerevil.com` as the server (it's mapped to
+   `https://nolongerevil.com`).
+3. Open **Advanced**, choose **Bearer**, and paste the `nle_…` key.
+
+Temperature, mode, away, fan and schedule work through the hosted `/api/v1`
+API. Editing eco (away) temperatures isn't available on the hosted API, and
+schedule edits that change the schedule's mode (HEAT/COOL/RANGE) may not take
+effect on the device.
+
 You can re-edit the server URL, change device names, view logs, or
 disconnect at any time from **Settings**.
 

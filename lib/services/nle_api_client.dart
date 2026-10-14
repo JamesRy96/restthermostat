@@ -3,6 +3,7 @@ import 'package:dio/dio.dart';
 import '../models/devices_response.dart';
 import '../models/schedule.dart';
 import 'app_logger.dart';
+import 'hosted_api.dart';
 import 'nle_api_logging_interceptor.dart';
 import 'nle_error.dart';
 
@@ -10,11 +11,22 @@ class NleApiClient {
   final Dio dio;
   final AppLogger? _logger;
 
+  /// True when talking to the hosted NoLongerEvil service
+  /// (`https://nolongerevil.com`) instead of a self-hosted Control API.
+  /// Reads and writes are translated at this boundary; see `hosted_api.dart`.
+  final bool hosted;
+
+  /// Hosted mode only: serial → hosted device id, and serial → last-known
+  /// mode. Refreshed on every [fetchDevicesJson].
+  final Map<String, String> _hostedIds = {};
+  final Map<String, String> _hostedModes = {};
+
   // Initializing-formal would require the constructor param to be named
   // `_logger` (matching the field), which is awkward for a public API. The
   // `:` form keeps the named arg `logger`.
   // ignore: prefer_initializing_formals
-  const NleApiClient({required this.dio, AppLogger? logger}) : _logger = logger;
+  NleApiClient({required this.dio, AppLogger? logger, this.hosted = false})
+    : _logger = logger;
 
   /// Production factory. Installs the diagnostic-logging interceptor so every
   /// HTTP call appears in [AppLogger]; logs the configured auth presence once
@@ -48,7 +60,9 @@ class NleApiClient {
     );
     dio.interceptors.add(NleApiLoggingInterceptor(logger: effectiveLogger));
     effectiveLogger.info('auth: ${_authPresence(authHeaders)}');
-    return NleApiClient(dio: dio, logger: effectiveLogger);
+    final hosted = isHostedBaseUrl(baseUrl);
+    if (hosted) effectiveLogger.info('api: hosted v1');
+    return NleApiClient(dio: dio, logger: effectiveLogger, hosted: hosted);
   }
 
   AppLogger get _log => _logger ?? AppLogger.instance;
@@ -63,6 +77,7 @@ class NleApiClient {
   /// the parsed object graph. Throws [NleError] subclasses on HTTP failure;
   /// the body's shape isn't validated here (callers do that).
   Future<Map<String, dynamic>> fetchDevicesJson() async {
+    if (hosted) return _hostedFetchDevicesJson();
     try {
       final response = await dio.get<Map<String, dynamic>>('/api/devices');
       return response.data!;
@@ -79,10 +94,15 @@ class NleApiClient {
   Future<Schedule?> getSchedule(String serial) async {
     final Response<Map<String, dynamic>> response;
     try {
-      response = await dio.get<Map<String, dynamic>>(
-        '/api/schedule',
-        queryParameters: {'serial': serial},
-      );
+      response = hosted
+          ? await dio.get<Map<String, dynamic>>(
+              '/api/v1/thermostat/'
+              '${Uri.encodeComponent(await _hostedIdFor(serial))}/schedule',
+            )
+          : await dio.get<Map<String, dynamic>>(
+              '/api/schedule',
+              queryParameters: {'serial': serial},
+            );
     } on DioException catch (e) {
       throw NleError.fromDio(e);
     }
@@ -116,19 +136,103 @@ class NleApiClient {
     Duration retryDelay = const Duration(seconds: 2),
   }) async {
     _log.commandIssued(command, value);
-    final data = {'serial': serial, 'command': command, 'value': value};
+    final Future<void> Function() send;
+    if (hosted) {
+      final deviceId = await _hostedIdFor(serial);
+      HostedRequest? req;
+      try {
+        req = hostedRequestFor(
+          deviceId: deviceId,
+          command: command,
+          value: value,
+          currentMode: _hostedModes[serial],
+        );
+      } on HostedUnsupportedCommand catch (e) {
+        _log.info('hosted: skipped unsupported command $command');
+        throw NleClientError(statusCode: 501, serverMessage: e.toString());
+      }
+      if (req == null) return;
+      final r = req;
+      send = () => dio.request<dynamic>(
+        r.path,
+        data: r.body,
+        options: Options(method: r.method),
+      );
+    } else {
+      final data = {'serial': serial, 'command': command, 'value': value};
+      send = () => dio.post<dynamic>('/command', data: data);
+    }
     try {
-      await dio.post<dynamic>('/command', data: data);
+      await send();
       return;
     } on DioException catch (e) {
       if (!_isTransient(e)) throw NleError.fromDio(e);
       await Future<void>.delayed(retryDelay);
       try {
-        await dio.post<dynamic>('/command', data: data);
+        await send();
       } on DioException catch (e2) {
         throw NleError.fromDio(e2);
       }
     }
+  }
+
+  /// Hosted mode: list devices, then fetch each device's status and reshape
+  /// the whole thing into the self-hosted `/api/devices` body.
+  Future<Map<String, dynamic>> _hostedFetchDevicesJson() async {
+    try {
+      final list = await dio.get<Map<String, dynamic>>('/api/v1/devices');
+      final entries = (list.data?['devices'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList();
+      final statuses = await Future.wait(
+        entries.map(
+          (e) => dio.get<Map<String, dynamic>>(
+            '/api/v1/thermostat/'
+            '${Uri.encodeComponent(e['id'] as String)}/status',
+          ),
+        ),
+      );
+      final devices = <Map<String, dynamic>>[];
+      for (var i = 0; i < entries.length; i++) {
+        final body = statuses[i].data ?? const <String, dynamic>{};
+        final json = _parse(
+          body,
+          () => hostedStatusToDeviceJson(body, listEntry: entries[i]),
+        );
+        final serial = json['serial'] as String;
+        _hostedIds[serial] = entries[i]['id'] as String;
+        _hostedModes[serial] = json['mode'] as String;
+        devices.add(json);
+      }
+      return {'devices': devices, 'total': devices.length};
+    } on DioException catch (e) {
+      throw NleError.fromDio(e);
+    }
+  }
+
+  /// Hosted mode: the hosted device id for [serial], fetching the device list
+  /// if it isn't cached yet.
+  Future<String> _hostedIdFor(String serial) async {
+    final cached = _hostedIds[serial];
+    if (cached != null) return cached;
+    try {
+      final list = await dio.get<Map<String, dynamic>>('/api/v1/devices');
+      for (final e in (list.data?['devices'] as List<dynamic>? ?? const [])) {
+        if (e is Map<String, dynamic> && e['serial'] is String) {
+          _hostedIds[e['serial'] as String] = e['id'] as String;
+        }
+      }
+    } on DioException catch (e) {
+      throw NleError.fromDio(e);
+    }
+    final id = _hostedIds[serial];
+    if (id == null) {
+      throw NleClientError(
+        statusCode: 404,
+        serverMessage: 'Device $serial not found on the hosted service.',
+      );
+    }
+    return id;
   }
 
   static bool _isTransient(DioException e) {

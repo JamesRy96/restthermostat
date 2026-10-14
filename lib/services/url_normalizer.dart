@@ -1,6 +1,10 @@
+import 'hosted_api.dart';
+
 /// Normalizes a user-typed server URL per DESIGN §7.5.
 ///
 /// Rules:
+/// - The hosted service (`nolongerevil.com`) always maps to
+///   `https://nolongerevil.com:443`.
 /// - Missing scheme → default `http://`.
 /// - Missing port → scheme-aware default: `:8082` for `http` (a direct-LAN
 ///   NLE server), `:443` for `https` (a reverse proxy / Cloudflare front that
@@ -19,6 +23,14 @@ String normalizeServerUrl(String input) {
   if (trimmed.isEmpty) {
     throw const UrlNormalizationException('Server address is required.');
   }
+
+  // The hosted NoLongerEvil service is only reachable over https on 443 —
+  // don't let the self-hosted `http://…:8082` defaults apply to it.
+  final hostOnly = trimmed
+      .replaceFirst(RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://'), '')
+      .split(RegExp(r'[/:]'))
+      .first;
+  if (isHostedHost(hostOnly)) return hostedBaseUrl;
 
   final withScheme = trimmed.contains('://') ? trimmed : 'http://$trimmed';
 
